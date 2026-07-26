@@ -1905,7 +1905,6 @@ swash_window_restore_save_button(gpointer user_data)
 
   self->save_feedback_timeout_id = 0;
   swash_window_reset_save_button(self);
-  g_object_unref(self);
   return G_SOURCE_REMOVE;
 }
 
@@ -1919,22 +1918,15 @@ swash_window_show_save_success(gpointer user_data)
   gtk_stack_set_visible_child(self->save_icon_stack, GTK_WIDGET(self->save_success_icon));
   self->save_feedback_timeout_id = g_timeout_add(1200,
                                                  swash_window_restore_save_button,
-                                                 g_object_ref(self));
-  g_object_unref(self);
+                                                 self);
   return G_SOURCE_REMOVE;
 }
 
 static void
 swash_window_begin_save_feedback(SwashWindow *self)
 {
-  if (self->save_spinner_timeout_id != 0)
-    g_source_remove(self->save_spinner_timeout_id);
-
-  if (self->save_feedback_timeout_id != 0)
-    g_source_remove(self->save_feedback_timeout_id);
-
-  self->save_spinner_timeout_id = 0;
-  self->save_feedback_timeout_id = 0;
+  g_clear_handle_id(&self->save_spinner_timeout_id, g_source_remove);
+  g_clear_handle_id(&self->save_feedback_timeout_id, g_source_remove);
   self->save_feedback_started_at = g_get_monotonic_time();
 
   gtk_stack_set_visible_child(self->save_icon_stack, GTK_WIDGET(self->save_working_icon));
@@ -1949,15 +1941,14 @@ swash_window_finish_save_feedback(SwashWindow *self)
   gint64 elapsed = g_get_monotonic_time() - self->save_feedback_started_at;
   guint delay_ms = 0;
 
-  if (self->save_spinner_timeout_id != 0)
-    g_source_remove(self->save_spinner_timeout_id);
+  g_clear_handle_id(&self->save_spinner_timeout_id, g_source_remove);
 
   if (elapsed < min_spinner_us)
     delay_ms = (guint) ((min_spinner_us - elapsed + 999) / 1000);
 
   self->save_spinner_timeout_id = g_timeout_add(delay_ms,
                                                 swash_window_show_save_success,
-                                                g_object_ref(self));
+                                                self);
 }
 
 
@@ -2365,14 +2356,8 @@ swash_window_save_export_ready(GObject      *source_object,
   (void) source_object;
 
   if (!g_task_propagate_boolean(G_TASK(result), &error)) {
-    if (self->save_spinner_timeout_id != 0)
-      g_source_remove(self->save_spinner_timeout_id);
-
-    if (self->save_feedback_timeout_id != 0)
-      g_source_remove(self->save_feedback_timeout_id);
-
-    self->save_spinner_timeout_id = 0;
-    self->save_feedback_timeout_id = 0;
+    g_clear_handle_id(&self->save_spinner_timeout_id, g_source_remove);
+    g_clear_handle_id(&self->save_feedback_timeout_id, g_source_remove);
     swash_window_reset_save_button(self);
     swash_window_show_error(self, error->message);
     swash_save_operation_free(operation);
@@ -3065,10 +3050,8 @@ swash_window_dispose(GObject *object)
   swash_window_clear_annotations(self);
   g_clear_handle_id(&self->copy_feedback_timeout_id, g_source_remove);
   g_clear_handle_id(&self->auto_copy_throttle_id, g_source_remove);
-  if (self->save_spinner_timeout_id != 0)
-    g_source_remove(self->save_spinner_timeout_id);
-  if (self->save_feedback_timeout_id != 0)
-    g_source_remove(self->save_feedback_timeout_id);
+  g_clear_handle_id(&self->save_spinner_timeout_id, g_source_remove);
+  g_clear_handle_id(&self->save_feedback_timeout_id, g_source_remove);
   swash_window_clear_history(self);
   g_clear_pointer(&self->document, swash_document_free);
   g_clear_object(&self->start_window_controls_children);
