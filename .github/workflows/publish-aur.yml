@@ -28,6 +28,10 @@ jobs:
       AUR_PACKAGE: swash
       AUR_REPOSITORY: ssh://aur@aur.archlinux.org/swash.git
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Install tools
         run: pacman -Syu --noconfirm --needed curl git openssh
@@ -59,17 +63,30 @@ jobs:
             exit 1
           fi
 
-          install -d -m 700 "${HOME}/.ssh"
-          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/aur"
-          chmod 600 "${HOME}/.ssh/aur"
-          ssh-keyscan -H aur.archlinux.org > "${HOME}/.ssh/known_hosts"
+          account_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          if [[ -z "${account_home}" || "${account_home}" != /* ]]; then
+            echo "Could not resolve the container account home directory" >&2
+            exit 1
+          fi
+
+          ssh_dir="${account_home}/.ssh"
+          install -d -m 700 "${ssh_dir}"
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > "${ssh_dir}/aur"
+          chmod 600 "${ssh_dir}/aur"
+
+          ssh-keyscan -T 10 -t ed25519 aur.archlinux.org \
+            > "${ssh_dir}/known_hosts"
+
           printf '%s\n' \
             "Host aur.archlinux.org" \
             "  User aur" \
-            "  IdentityFile ~/.ssh/aur" \
+            "  IdentityFile ${ssh_dir}/aur" \
+            "  UserKnownHostsFile ${ssh_dir}/known_hosts" \
             "  IdentitiesOnly yes" \
-            > "${HOME}/.ssh/config"
-          chmod 600 "${HOME}/.ssh/config"
+            "  BatchMode yes" \
+            "  StrictHostKeyChecking yes" \
+            > "${ssh_dir}/config"
+          chmod 600 "${ssh_dir}/config"
 
       - name: Update and publish package
         env:
