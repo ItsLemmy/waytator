@@ -158,7 +158,9 @@ struct _SwashWindow {
   guint save_spinner_timeout_id;
   guint save_feedback_timeout_id;
   gint64 save_feedback_started_at;
-  gboolean copy_in_progress;
+  guint auto_copy_throttle_id;
+  gint64 auto_copy_last_claim;
+  gint64 clipboard_claim_cost;
   gboolean auto_copy_pending;
   guint ocr_generation;
   gboolean ocr_running;
@@ -209,7 +211,6 @@ struct _SwashWindow {
   gboolean esc_closes_window;
   gboolean close_after_copy;
   gboolean close_after_save;
-  gboolean close_after_current_copy;
   GdkModifierType angle_snap_modifiers;
   gboolean allow_highlighter_overlap;
   gboolean floating_controls_blur;

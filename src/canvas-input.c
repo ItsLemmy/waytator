@@ -1042,8 +1042,16 @@ swash_window_text_editing_stop(SwashWindow *self)
     g_source_remove(self->text_cursor_blink_id);
     self->text_cursor_blink_id = 0;
   }
-  if (self->text_input_hidden != NULL)
+  if (self->text_input_hidden != NULL) {
+    const gboolean had_focus = gtk_widget_has_focus(self->text_input_hidden);
+
     gtk_widget_set_visible(self->text_input_hidden, FALSE);
+    /* Focus has to leave the hidden entry explicitly: while it holds focus,
+     * key events are routed to it and window shortcuts such as copy never
+     * reach the canvas. */
+    if (had_focus)
+      gtk_widget_grab_focus(GTK_WIDGET(self->drawing_area));
+  }
   gtk_widget_queue_draw(GTK_WIDGET(self->drawing_area));
 }
 
@@ -1151,10 +1159,18 @@ swash_window_text_input_key_pressed(GtkEventControllerKey *controller,
 
   (void) controller;
   (void) keycode;
-  (void) state;
 
   if (!self->text_editing)
     return FALSE;
+
+  /* The hidden entry consumes every key while text is being typed, so the
+   * copy shortcut is handled here as well; the annotation in progress is
+   * committed first so that it is part of what gets copied. */
+  if (swash_window_shortcut_matches(self, SWASH_SHORTCUT_COPY, keyval, state)) {
+    swash_window_text_editing_commit(self);
+    gtk_widget_activate_action(GTK_WIDGET(self), "win.copy-buffer", NULL);
+    return TRUE;
+  }
 
   if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
     swash_window_text_editing_commit(self);

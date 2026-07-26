@@ -31,10 +31,20 @@ swash_export_copy_mime_type(const char *format)
   return g_strcmp0(format, "jpeg") == 0 ? "image/jpeg" : "image/png";
 }
 
+/* Clipboard copies are encoded on the main thread so that the selection is
+ * claimed while the window still has keyboard focus, so they trade a little
+ * size for latency. gdk-pixbuf switches PNG filtering strategy above level 2,
+ * which costs an order of magnitude in time (4K photo content: 62 ms at level
+ * 2 versus 815 ms at level 9) for under 1% in size. Saved files keep level 9,
+ * where the encode is off the interaction path. */
+#define SWASH_EXPORT_PNG_COMPRESSION "9"
+#define SWASH_EXPORT_COPY_PNG_COMPRESSION "2"
+
 static void
 swash_export_options(const char  *format,
                         char       **option_keys,
-                        char       **option_values)
+                        char       **option_values,
+                        gboolean     for_copy)
 {
   option_keys[0] = NULL;
   option_values[0] = NULL;
@@ -47,7 +57,8 @@ swash_export_options(const char  *format,
 
   if (g_strcmp0(format, "png") == 0) {
     option_keys[0] = "compression";
-    option_values[0] = "9";
+    option_values[0] = for_copy ? SWASH_EXPORT_COPY_PNG_COMPRESSION
+                                : SWASH_EXPORT_PNG_COMPRESSION;
   }
 }
 
@@ -96,6 +107,17 @@ swash_export_pixbuf_from_surface(cairo_surface_t *surface)
     for (x = 0; x < width; x++) {
       const guint32 pixel = src[x];
       const guchar alpha = pixel >> 24;
+
+      /* Screenshots are opaque almost everywhere, and premultiplied values
+       * are already the final ones at full alpha: skipping the division there
+       * takes this loop from 44 ms to 11 ms on a 12 MP image. */
+      if (alpha == 0xff) {
+        dst[x * 4] = (pixel >> 16) & 0xff;
+        dst[x * 4 + 1] = (pixel >> 8) & 0xff;
+        dst[x * 4 + 2] = pixel & 0xff;
+        dst[x * 4 + 3] = 0xff;
+        continue;
+      }
 
       dst[x * 4] = swash_export_unpremultiply((pixel >> 16) & 0xff, alpha);
       dst[x * 4 + 1] = swash_export_unpremultiply((pixel >> 8) & 0xff, alpha);
@@ -220,18 +242,11 @@ swash_copy_result_free(SwashCopyResult *result)
   g_free(result);
 }
 
-void
-swash_export_run_task(GTask        *task,
-                         gpointer      source_object,
-                         gpointer      task_data,
-                         GCancellable *cancellable)
+static cairo_surface_t *
+swash_export_render_surface(SwashExportRequest *request)
 {
-  SwashExportRequest *request = task_data;
   cairo_surface_t *surface;
   cairo_t *cr;
-
-  (void) source_object;
-  (void) cancellable;
 
   surface = cairo_image_surface_create_for_data(request->pixels,
                                                 CAIRO_FORMAT_ARGB32,
@@ -247,65 +262,91 @@ swash_export_run_task(GTask        *task,
                           request->image_generation);
   cairo_destroy(cr);
   cairo_surface_flush(surface);
+  return surface;
+}
 
-  if (request->kind == SWASH_EXPORT_COPY) {
-    g_autoptr(GdkPixbuf) pixbuf = NULL;
-    g_autoptr(GdkPixbuf) encoded_pixbuf = NULL;
-    g_autoptr(GBytes) texture_bytes = NULL;
-    g_autoptr(GError) error = NULL;
-    char *buffer = NULL;
-    gsize length = 0;
-    char *option_keys[] = { NULL, NULL };
-    char *option_values[] = { NULL, NULL };
-    SwashCopyResult *result = g_new0(SwashCopyResult, 1);
+SwashCopyResult *
+swash_export_render_copy(SwashExportRequest *request,
+                            GError            **error)
+{
+  g_autoptr(GdkPixbuf) pixbuf = NULL;
+  g_autoptr(GdkPixbuf) encoded_pixbuf = NULL;
+  g_autoptr(GBytes) texture_bytes = NULL;
+  cairo_surface_t *surface;
+  char *buffer = NULL;
+  gsize length = 0;
+  char *option_keys[] = { NULL, NULL };
+  char *option_values[] = { NULL, NULL };
+  SwashCopyResult *result;
 
-    pixbuf = swash_export_pixbuf_from_surface(surface);
-    cairo_surface_destroy(surface);
+  g_return_val_if_fail(request != NULL, NULL);
+  g_return_val_if_fail(request->kind == SWASH_EXPORT_COPY, NULL);
 
-    if (pixbuf == NULL) {
-      g_free(result);
-      g_task_return_new_error(task,
-                              G_IO_ERROR,
-                              G_IO_ERROR_FAILED,
-                              "Could not encode the current image");
-      return;
-    }
+  surface = swash_export_render_surface(request);
+  pixbuf = swash_export_pixbuf_from_surface(surface);
+  cairo_surface_destroy(surface);
 
-    texture_bytes = g_bytes_new(request->pixels, request->stride * request->height);
-    result->texture = gdk_memory_texture_new(request->width,
-                                             request->height,
-                                             GDK_MEMORY_DEFAULT,
-                                             texture_bytes,
-                                             request->stride);
-
-    swash_export_options(request->copy_format, option_keys, option_values);
-    encoded_pixbuf = swash_export_prepare_pixbuf_for_format(pixbuf, request->copy_format);
-    if (encoded_pixbuf == NULL) {
-      g_free(result);
-      g_task_return_new_error(task,
-                              G_IO_ERROR,
-                              G_IO_ERROR_FAILED,
-                              "Could not prepare the current image for export");
-      return;
-    }
-
-    if (!gdk_pixbuf_save_to_bufferv(encoded_pixbuf,
-                                    &buffer,
-                                    &length,
-                                    request->copy_format,
-                                    option_keys,
-                                    option_values,
-                                    &error)) {
-      g_free(result);
-      g_task_return_error(task, g_steal_pointer(&error));
-      return;
-    }
-
-    result->mime_type = swash_export_copy_mime_type(request->copy_format);
-    result->bytes = g_bytes_new_take(buffer, length);
-    g_task_return_pointer(task, result, (GDestroyNotify) swash_copy_result_free);
-    return;
+  if (pixbuf == NULL) {
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_FAILED,
+                "Could not encode the current image");
+    return NULL;
   }
+
+  result = g_new0(SwashCopyResult, 1);
+  /* The rendered pixels are handed to the texture rather than copied: the
+   * request is spent once the copy has been rendered. */
+  texture_bytes = g_bytes_new_take(g_steal_pointer(&request->pixels),
+                                   request->stride * request->height);
+  result->texture = gdk_memory_texture_new(request->width,
+                                           request->height,
+                                           GDK_MEMORY_DEFAULT,
+                                           texture_bytes,
+                                           request->stride);
+
+  swash_export_options(request->copy_format, option_keys, option_values, TRUE);
+  encoded_pixbuf = swash_export_prepare_pixbuf_for_format(pixbuf, request->copy_format);
+  if (encoded_pixbuf == NULL) {
+    swash_copy_result_free(result);
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_FAILED,
+                "Could not prepare the current image for export");
+    return NULL;
+  }
+
+  if (!gdk_pixbuf_save_to_bufferv(encoded_pixbuf,
+                                  &buffer,
+                                  &length,
+                                  request->copy_format,
+                                  option_keys,
+                                  option_values,
+                                  error)) {
+    swash_copy_result_free(result);
+    return NULL;
+  }
+
+  result->mime_type = swash_export_copy_mime_type(request->copy_format);
+  result->bytes = g_bytes_new_take(buffer, length);
+  return result;
+}
+
+void
+swash_export_run_task(GTask        *task,
+                         gpointer      source_object,
+                         gpointer      task_data,
+                         GCancellable *cancellable)
+{
+  SwashExportRequest *request = task_data;
+  cairo_surface_t *surface;
+
+  (void) source_object;
+  (void) cancellable;
+
+  g_return_if_fail(request->kind == SWASH_EXPORT_SAVE);
+
+  surface = swash_export_render_surface(request);
 
   g_autofree char *path = g_file_get_path(request->file);
   g_autoptr(GError) error = NULL;
@@ -336,7 +377,7 @@ swash_export_run_task(GTask        *task,
   }
 
   format = swash_export_format_from_path(path);
-  swash_export_options(format, option_keys, option_values);
+  swash_export_options(format, option_keys, option_values, FALSE);
   encoded_pixbuf = swash_export_prepare_pixbuf_for_format(pixbuf, format);
 
   if (encoded_pixbuf == NULL) {

@@ -10,6 +10,9 @@
 
 #include <cairo.h>
 #include <string.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 G_DEFINE_FINAL_TYPE(SwashWindow, swash_window, ADW_TYPE_APPLICATION_WINDOW)
 
@@ -29,9 +32,11 @@ static void swash_window_ocr_panel_open_changed(GObject    *object,
 static void swash_window_show_error(SwashWindow *self,
                                        const char     *message);
 static gboolean swash_window_has_unsaved_changes(SwashWindow *self);
-static void swash_window_copy_export_ready(GObject      *source_object,
-                                              GAsyncResult *result,
-                                              gpointer      user_data);
+static void swash_window_log_formats(const char        *label,
+                                        GdkContentFormats *formats);
+static void swash_window_clipboard_store_ready(GObject      *source_object,
+                                                  GAsyncResult *result,
+                                                  gpointer      user_data);
 static gboolean swash_window_parse_accelerator(const char       *accelerator,
                                                   guint            *keyval,
                                                   GdkModifierType  *modifiers);
@@ -1682,20 +1687,38 @@ swash_window_restore_copy_button(gpointer user_data)
 
   self->copy_feedback_timeout_id = 0;
   gtk_stack_set_visible_child(self->copy_icon_stack, GTK_WIDGET(self->copy_default_icon));
-  g_object_unref(self);
   return G_SOURCE_REMOVE;
 }
 
-void
-swash_window_trigger_copy(SwashWindow *self,
-                             gboolean        user_initiated)
+/* Wayland compositors only honour a selection claim coming from the client
+ * that holds keyboard focus. A claim made while the window is inactive is
+ * dropped by the compositor without any error reaching GDK, which still
+ * reports the content as locally owned, so the window state has to be checked
+ * up front rather than the result checked afterwards. */
+static gboolean
+swash_window_can_claim_clipboard(SwashWindow *self)
+{
+  return gtk_window_is_active(GTK_WINDOW(self));
+}
+
+/* Claims the selection synchronously, on the main thread, so that it happens
+ * within the input event that asked for it and therefore while the window is
+ * still focused. */
+static gboolean
+swash_window_claim_clipboard(SwashWindow *self,
+                                gboolean        report_errors)
 {
   g_autoptr(GError) error = NULL;
-  g_autoptr(GTask) task = NULL;
+  g_autoptr(GdkContentProvider) provider = NULL;
+  g_autoptr(GdkContentFormats) provider_formats = NULL;
+  GdkContentProvider *providers[2];
   SwashExportRequest *request;
+  SwashCopyResult *copy_result;
+  GdkClipboard *clipboard;
+  const gint64 started_at = g_get_monotonic_time();
 
-  if (self->texture == NULL || self->copy_in_progress)
-    return;
+  if (self->texture == NULL)
+    return FALSE;
 
   request = swash_export_request_new(self->texture,
                                         swash_window_strokes(self),
@@ -1709,41 +1732,159 @@ swash_window_trigger_copy(SwashWindow *self,
                                         swash_document_get_image_generation(self->document),
                                         &error);
   if (request == NULL) {
-    swash_window_show_error(self, error->message);
-    return;
+    if (report_errors)
+      swash_window_show_error(self, error->message);
+    else
+      g_warning("Auto-copy failed: %s", error->message);
+    return FALSE;
   }
 
-  self->copy_in_progress = TRUE;
-  self->close_after_current_copy = user_initiated && self->close_after_copy;
-  task = g_task_new(self, NULL, swash_window_copy_export_ready, g_object_ref(self));
-  g_task_set_task_data(task, request, (GDestroyNotify) swash_export_request_free);
-  g_task_run_in_thread(task, swash_export_run_task);
-}
-
-void
-swash_window_maybe_auto_copy_latest_change(SwashWindow *self)
-{
-  if (!self->auto_copy_latest_change || self->texture == NULL || !swash_window_has_unsaved_changes(self))
-    return;
-
-  if (self->copy_in_progress) {
-    self->auto_copy_pending = TRUE;
-    return;
+  copy_result = swash_export_render_copy(request, &error);
+  swash_export_request_free(request);
+  if (copy_result == NULL) {
+    if (report_errors)
+      swash_window_show_error(self, error->message);
+    else
+      g_warning("Auto-copy failed: %s", error->message);
+    return FALSE;
   }
 
-  swash_window_trigger_copy(self, FALSE);
+  clipboard = gdk_display_get_clipboard(gtk_widget_get_display(GTK_WIDGET(self)));
+  /* The texture is offered first for consumers that take GdkTexture directly;
+   * the pre-encoded bytes keep image/png from being re-serialized, on the main
+   * thread, every time a clipboard manager or paste target asks for it. */
+  providers[0] = gdk_content_provider_new_typed(GDK_TYPE_TEXTURE, copy_result->texture);
+  providers[1] = gdk_content_provider_new_for_bytes(copy_result->mime_type, copy_result->bytes);
+  provider = gdk_content_provider_new_union(providers, G_N_ELEMENTS(providers));
+  swash_copy_result_free(copy_result);
+
+  provider_formats = gdk_content_provider_ref_formats(provider);
+  swash_window_log_formats("Clipboard provider formats", provider_formats);
+
+  if (!gdk_clipboard_set_content(clipboard, provider)) {
+    if (report_errors)
+      swash_window_show_error(self, "Could not copy image to clipboard");
+    else
+      g_warning("Auto-copy failed: could not claim the clipboard");
+    return FALSE;
+  }
+
+  swash_window_log_formats("Clipboard accepted formats", gdk_clipboard_get_formats(clipboard));
+  self->clipboard_claim_cost = g_get_monotonic_time() - started_at;
+  g_debug("Clipboard claimed in %.1f ms (window %s)",
+          self->clipboard_claim_cost / 1000.0,
+          swash_window_can_claim_clipboard(self) ? "active" : "inactive");
+  return TRUE;
 }
 
 static void
 swash_window_flash_copy_success(SwashWindow *self)
 {
-  if (self->copy_feedback_timeout_id != 0)
-    g_source_remove(self->copy_feedback_timeout_id);
-
+  g_clear_handle_id(&self->copy_feedback_timeout_id, g_source_remove);
   gtk_stack_set_visible_child(self->copy_icon_stack, GTK_WIDGET(self->copy_success_icon));
   self->copy_feedback_timeout_id = g_timeout_add(1200,
                                                  swash_window_restore_copy_button,
-                                                 g_object_ref(self));
+                                                 self);
+}
+
+void
+swash_window_trigger_copy(SwashWindow *self,
+                             gboolean        user_initiated)
+{
+  if (!swash_window_claim_clipboard(self, user_initiated))
+    return;
+
+  self->auto_copy_pending = FALSE;
+  self->auto_copy_last_claim = g_get_monotonic_time();
+
+  if (!user_initiated)
+    return;
+
+  if (self->close_after_copy) {
+    GdkClipboard *clipboard = gdk_display_get_clipboard(gtk_widget_get_display(GTK_WIDGET(self)));
+
+    gdk_clipboard_store_async(clipboard,
+                              G_PRIORITY_DEFAULT,
+                              NULL,
+                              swash_window_clipboard_store_ready,
+                              g_object_ref(self));
+    return;
+  }
+
+  swash_window_flash_copy_success(self);
+}
+
+/* Auto-copy runs off document changes, so it is throttled: the first change
+ * claims immediately (a copy has to be on the clipboard before the user
+ * switches away), and further changes within the interval are coalesced into
+ * one trailing claim. Claiming is synchronous, so the interval follows what a
+ * claim actually costs on this image — a 12 MP photo takes ~130 ms, and
+ * repeating that every 200 ms while strokes are being drawn would be felt. */
+#define SWASH_AUTO_COPY_INTERVAL_MS 200
+#define SWASH_AUTO_COPY_MAX_INTERVAL_MS 2000
+
+static guint
+swash_window_auto_copy_interval(SwashWindow *self)
+{
+  const gint64 budgeted = self->clipboard_claim_cost * 3 / G_TIME_SPAN_MILLISECOND;
+
+  return (guint) CLAMP(budgeted,
+                       SWASH_AUTO_COPY_INTERVAL_MS,
+                       SWASH_AUTO_COPY_MAX_INTERVAL_MS);
+}
+
+static gboolean
+swash_window_auto_copy_timeout(gpointer user_data)
+{
+  SwashWindow *self = SWASH_WINDOW(user_data);
+
+  self->auto_copy_throttle_id = 0;
+  if (self->auto_copy_pending)
+    swash_window_trigger_copy(self, FALSE);
+
+  return G_SOURCE_REMOVE;
+}
+
+void
+swash_window_maybe_auto_copy_latest_change(SwashWindow *self)
+{
+  guint interval;
+
+  if (!self->auto_copy_latest_change || self->texture == NULL || !swash_window_has_unsaved_changes(self))
+    return;
+
+  self->auto_copy_pending = TRUE;
+
+  /* An inactive window cannot take the selection; the claim is retried when
+   * focus comes back. */
+  if (!swash_window_can_claim_clipboard(self))
+    return;
+
+  if (self->auto_copy_throttle_id != 0)
+    return;
+
+  interval = swash_window_auto_copy_interval(self);
+  self->auto_copy_throttle_id = g_timeout_add(interval,
+                                              swash_window_auto_copy_timeout,
+                                              self);
+
+  if (g_get_monotonic_time() - self->auto_copy_last_claim
+      >= (gint64) interval * G_TIME_SPAN_MILLISECOND)
+    swash_window_trigger_copy(self, FALSE);
+}
+
+static void
+swash_window_active_changed(GObject    *object,
+                               GParamSpec *pspec,
+                               gpointer    user_data)
+{
+  SwashWindow *self = SWASH_WINDOW(object);
+
+  (void) pspec;
+  (void) user_data;
+
+  if (self->auto_copy_pending && swash_window_can_claim_clipboard(self))
+    swash_window_trigger_copy(self, FALSE);
 }
 
 void
@@ -2079,6 +2220,106 @@ swash_window_log_formats(const char      *label,
   g_debug("%s: %s", label, description);
 }
 
+/* A Wayland selection lives in the client that owns it, and no session
+ * component takes it over when that client exits: a clipboard history manager
+ * records the content but does not become its owner. Quitting right after the
+ * copy therefore throws it away. The window is destroyed as the preference
+ * asks, but the process stays alive without any window, still serving the
+ * selection, until another client claims it — the same thing wl-copy does. */
+#define SWASH_CLIPBOARD_HOLD_TIMEOUT_SECONDS (10 * 60)
+
+typedef struct {
+  GApplication *application;
+  GdkClipboard *clipboard;
+  gulong changed_handler;
+  guint timeout_id;
+} SwashClipboardHold;
+
+static void
+swash_clipboard_hold_release(SwashClipboardHold *hold)
+{
+  g_clear_signal_handler(&hold->changed_handler, hold->clipboard);
+  g_clear_handle_id(&hold->timeout_id, g_source_remove);
+  g_application_release(hold->application);
+  g_object_unref(hold->application);
+  g_object_unref(hold->clipboard);
+  g_free(hold);
+}
+
+static void
+swash_clipboard_hold_changed(GdkClipboard *clipboard,
+                                gpointer      user_data)
+{
+  SwashClipboardHold *hold = user_data;
+
+  if (gdk_clipboard_is_local(clipboard))
+    return;
+
+  g_debug("Clipboard claimed by another client; releasing hold");
+  swash_clipboard_hold_release(hold);
+}
+
+static gboolean
+swash_clipboard_hold_timeout(gpointer user_data)
+{
+  SwashClipboardHold *hold = user_data;
+
+  hold->timeout_id = 0;
+  g_debug("Clipboard hold expired after %d seconds", SWASH_CLIPBOARD_HOLD_TIMEOUT_SECONDS);
+  swash_clipboard_hold_release(hold);
+  return G_SOURCE_REMOVE;
+}
+
+/* Tearing the window down frees the document, the image and the render caches,
+ * but glibc keeps those arenas for a process that has nothing left to draw and
+ * may now sit idle for minutes. Returning them costs a fraction of a
+ * millisecond on a process that is only waiting to serve a paste. Deferred,
+ * because the window is still referenced by the store callback when the hold
+ * is set up and GTK finishes its own teardown afterwards. */
+static gboolean
+swash_clipboard_hold_trim_memory(gpointer user_data)
+{
+  (void) user_data;
+
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Destroys the window but keeps the application alive as the owner of the
+ * selection. The content provider holds its own texture and encoded bytes, so
+ * it stays servable once the window and its document are gone. */
+static void
+swash_window_close_holding_clipboard(SwashWindow *self)
+{
+  GtkApplication *application = gtk_window_get_application(GTK_WINDOW(self));
+  GdkClipboard *clipboard =
+    gdk_display_get_clipboard(gtk_widget_get_display(GTK_WIDGET(self)));
+  SwashClipboardHold *hold;
+
+  if (application == NULL) {
+    gtk_window_destroy(GTK_WINDOW(self));
+    return;
+  }
+
+  hold = g_new0(SwashClipboardHold, 1);
+  hold->application = g_object_ref(G_APPLICATION(application));
+  hold->clipboard = g_object_ref(clipboard);
+  hold->changed_handler = g_signal_connect(clipboard,
+                                           "changed",
+                                           G_CALLBACK(swash_clipboard_hold_changed),
+                                           hold);
+  hold->timeout_id = g_timeout_add_seconds(SWASH_CLIPBOARD_HOLD_TIMEOUT_SECONDS,
+                                           swash_clipboard_hold_timeout,
+                                           hold);
+  g_application_hold(hold->application);
+
+  gtk_window_destroy(GTK_WINDOW(self));
+  g_timeout_add_seconds(1, swash_clipboard_hold_trim_memory, NULL);
+}
+
 static void
 swash_window_clipboard_store_ready(GObject      *source_object,
                                       GAsyncResult *result,
@@ -2087,92 +2328,20 @@ swash_window_clipboard_store_ready(GObject      *source_object,
   SwashWindow *self = SWASH_WINDOW(user_data);
   g_autoptr(GError) error = NULL;
 
-  /* Wayland has no clipboard-manager store protocol, so storing always
-   * fails with NOT_SUPPORTED even though the content is already on the
-   * clipboard; treat it as success. */
-  if (!gdk_clipboard_store_finish(GDK_CLIPBOARD(source_object), result, &error)
-      && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED)) {
-    swash_window_show_error(self, error->message);
+  /* Storing hands the content to a clipboard manager that owns it from then
+   * on, which is exactly what closing needs — but only X11 has the protocol
+   * for it, and only when such a manager runs. Everywhere else this fails
+   * immediately and ownership has to be kept here instead. */
+  if (gdk_clipboard_store_finish(GDK_CLIPBOARD(source_object), result, &error)) {
+    gtk_window_destroy(GTK_WINDOW(self));
     g_object_unref(self);
     return;
   }
 
-  gtk_window_destroy(GTK_WINDOW(self));
-  g_object_unref(self);
-}
+  if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))
+    g_debug("Clipboard store failed: %s", error->message);
 
-static void
-swash_window_copy_export_ready(GObject      *source_object,
-                                  GAsyncResult *result,
-                                  gpointer      user_data)
-{
-  SwashWindow *self = SWASH_WINDOW(user_data);
-  g_autoptr(GError) error = NULL;
-  SwashCopyResult *copy_result;
-  g_autoptr(GdkContentProvider) provider = NULL;
-  g_autoptr(GdkContentProvider) bytes_provider = NULL;
-  g_autoptr(GdkContentProvider) texture_provider = NULL;
-  g_autoptr(GdkContentFormats) provider_formats = NULL;
-  GdkClipboard *clipboard;
-  const gboolean close_after_copy = self->close_after_current_copy;
-
-  (void) source_object;
-
-  copy_result = g_task_propagate_pointer(G_TASK(result), &error);
-  self->copy_in_progress = FALSE;
-  self->close_after_current_copy = FALSE;
-  if (copy_result == NULL) {
-    swash_window_show_error(self, error->message);
-    if (self->auto_copy_pending) {
-      self->auto_copy_pending = FALSE;
-      swash_window_maybe_auto_copy_latest_change(self);
-    }
-    g_object_unref(self);
-    return;
-  }
-
-  clipboard = gdk_display_get_clipboard(gtk_widget_get_display(GTK_WIDGET(self)));
-  bytes_provider = gdk_content_provider_new_for_bytes(copy_result->mime_type, copy_result->bytes);
-
-  if (copy_result->texture != NULL) {
-    GdkContentProvider *providers[2];
-
-    texture_provider = gdk_content_provider_new_typed(GDK_TYPE_TEXTURE, copy_result->texture);
-    providers[0] = g_steal_pointer(&texture_provider);
-    providers[1] = g_steal_pointer(&bytes_provider);
-    provider = gdk_content_provider_new_union(providers, G_N_ELEMENTS(providers));
-  } else {
-    provider = g_object_ref(bytes_provider);
-  }
-
-  provider_formats = gdk_content_provider_ref_formats(provider);
-  swash_window_log_formats("Clipboard provider formats", provider_formats);
-
-  if (!gdk_clipboard_set_content(clipboard, provider)) {
-    swash_copy_result_free(copy_result);
-    swash_window_show_error(self, "Could not copy image to clipboard");
-    g_object_unref(self);
-    return;
-  }
-
-  swash_window_log_formats("Clipboard accepted formats", gdk_clipboard_get_formats(clipboard));
-  swash_copy_result_free(copy_result);
-  if (close_after_copy) {
-    self->auto_copy_pending = FALSE;
-    gdk_clipboard_store_async(clipboard,
-                              G_PRIORITY_DEFAULT,
-                              NULL,
-                              swash_window_clipboard_store_ready,
-                              g_object_ref(self));
-    g_object_unref(self);
-    return;
-  }
-
-  swash_window_flash_copy_success(self);
-  if (self->auto_copy_pending) {
-    self->auto_copy_pending = FALSE;
-    swash_window_maybe_auto_copy_latest_change(self);
-  }
+  swash_window_close_holding_clipboard(self);
   g_object_unref(self);
 }
 
@@ -2894,8 +3063,8 @@ swash_window_dispose(GObject *object)
   swash_window_reset_active_stroke_nodes(self);
   swash_window_clear_ocr_results(self);
   swash_window_clear_annotations(self);
-  if (self->copy_feedback_timeout_id != 0)
-    g_source_remove(self->copy_feedback_timeout_id);
+  g_clear_handle_id(&self->copy_feedback_timeout_id, g_source_remove);
+  g_clear_handle_id(&self->auto_copy_throttle_id, g_source_remove);
   if (self->save_spinner_timeout_id != 0)
     g_source_remove(self->save_spinner_timeout_id);
   if (self->save_feedback_timeout_id != 0)
@@ -3106,11 +3275,50 @@ swash_window_ensure_css_loaded(void)
   }
 }
 
+/* A focused text view consumes the copy shortcut whether or not it has a
+ * selection, so with the OCR panel open Ctrl+C would silently do nothing.
+ * Copying text stays the behaviour when there is a selection; otherwise the
+ * shortcut falls through to copying the image. */
+static gboolean
+swash_window_ocr_text_key_pressed(GtkEventControllerKey *controller,
+                                     guint                  keyval,
+                                     guint                  keycode,
+                                     GdkModifierType        state,
+                                     gpointer               user_data)
+{
+  SwashWindow *self = SWASH_WINDOW(user_data);
+  GtkWidget *widget = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
+
+  (void) keycode;
+
+  if (!swash_window_shortcut_matches(self, SWASH_SHORTCUT_COPY, keyval, state))
+    return FALSE;
+
+  if (gtk_text_buffer_get_has_selection(gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget))))
+    return FALSE;
+
+  gtk_widget_activate_action(GTK_WIDGET(self), "win.copy-buffer", NULL);
+  return TRUE;
+}
+
+static void
+swash_window_watch_ocr_text_copy(SwashWindow *self,
+                                    GtkTextView *view)
+{
+  GtkEventController *keys = gtk_event_controller_key_new();
+
+  gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
+  g_signal_connect(keys, "key-pressed", G_CALLBACK(swash_window_ocr_text_key_pressed), self);
+  gtk_widget_add_controller(GTK_WIDGET(view), keys);
+}
+
 static void
 swash_window_setup_ocr_panel(SwashWindow *self)
 {
   gtk_text_view_set_monospace(self->ocr_selected_text_view, FALSE);
   gtk_text_view_set_monospace(self->ocr_all_text_view, FALSE);
+  swash_window_watch_ocr_text_copy(self, self->ocr_selected_text_view);
+  swash_window_watch_ocr_text_copy(self, self->ocr_all_text_view);
   gtk_stack_page_set_name(gtk_stack_get_page(self->ocr_panel_stack, GTK_WIDGET(self->ocr_selected_page)), "selected");
   gtk_stack_page_set_title(gtk_stack_get_page(self->ocr_panel_stack, GTK_WIDGET(self->ocr_selected_page)), "Selected region");
   gtk_stack_page_set_name(gtk_stack_get_page(self->ocr_panel_stack, GTK_WIDGET(self->ocr_all_page)), "all");
@@ -3259,6 +3467,7 @@ swash_window_init(SwashWindow *self)
   g_signal_connect(self->ocr_panel_toggle_button, "toggled", G_CALLBACK(swash_window_ocr_panel_toggled), self);
   g_signal_connect(self->ocr_panel_close_button, "clicked", G_CALLBACK(swash_window_ocr_panel_close_clicked), self);
   g_signal_connect(self->ocr_panel_bottom_sheet, "notify::open", G_CALLBACK(swash_window_ocr_panel_open_changed), self);
+  g_signal_connect(self, "notify::is-active", G_CALLBACK(swash_window_active_changed), NULL);
 
   swash_window_activate_tool_button(self);
   swash_window_update_size_controls(self);
